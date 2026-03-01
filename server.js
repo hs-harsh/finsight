@@ -1,73 +1,100 @@
 import express from 'express';
-import { createRequire } from 'module';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Proxy endpoint — keeps ANTHROPIC_API_KEY on the server
-app.post('/api/chat', async (req, res) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error('[FinSight] ERROR: ANTHROPIC_API_KEY environment variable is not set.');
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server.' });
-  }
+const MODEL = 'claude-sonnet-4-20250514';
 
-  // Always use a known-good model; override whatever the client sends
+// /health — quick check
+app.get('/health', (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY || '';
+  res.json({
+    status: 'ok',
+    apiKeySet: !!key,
+    apiKeyPrefix: key ? key.slice(0, 20) + '...' : 'NOT SET',
+    model: MODEL,
+    node: process.version,
+    uptime: Math.round(process.uptime()),
+  });
+});
+
+// /api/debug — sends a real 1-token request, returns raw Anthropic response
+app.get('/api/debug', async (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set on server' });
+
   const body = {
-    ...req.body,
-    model: 'claude-sonnet-4-5',
+    model: MODEL,
+    max_tokens: 10,
+    messages: [{ role: 'user', content: 'Reply with OK' }],
   };
 
-  console.log(`[FinSight] /api/chat → model=${body.model} max_tokens=${body.max_tokens} prompt_len=${JSON.stringify(body.messages).length}`);
-
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    res.status(r.status).json({ httpStatus: r.status, sentModel: MODEL, anthropicResponse: data });
+  } catch (err) {
+    res.status(502).json({ fetchError: err.message });
+  }
+});
+
+// /api/chat — main proxy
+app.post('/api/chat', async (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    console.error('[FinSight] ANTHROPIC_API_KEY is not set');
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+  }
+
+  const body = { ...req.body, model: MODEL };
+  console.log(`[FinSight] /api/chat model=${MODEL} max_tokens=${body.max_tokens} bytes=${JSON.stringify(body.messages).length}`);
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(body),
     });
 
-    const data = await response.json();
+    const data = await r.json();
 
-    if (!response.ok) {
-      console.error(`[FinSight] Anthropic API error ${response.status}:`, JSON.stringify(data).slice(0, 300));
-      return res.status(response.status).json(data);
+    if (!r.ok) {
+      console.error(`[FinSight] Anthropic error ${r.status}:`, JSON.stringify(data));
+      return res.status(r.status).json(data);
     }
 
-    console.log(`[FinSight] OK — input_tokens=${data.usage?.input_tokens} output_tokens=${data.usage?.output_tokens}`);
+    console.log(`[FinSight] OK in=${data.usage?.input_tokens} out=${data.usage?.output_tokens}`);
     res.json(data);
   } catch (err) {
-    console.error('[FinSight] Fetch error:', err.message);
-    res.status(502).json({ error: 'Upstream API error: ' + err.message });
+    console.error('[FinSight] fetch error:', err.message);
+    res.status(502).json({ error: 'Upstream fetch error: ' + err.message });
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    apiKeySet: !!process.env.ANTHROPIC_API_KEY,
-    model: 'claude-sonnet-4-5',
-    uptime: process.uptime(),
-  });
-});
-
-// Fallback — serve index.html for any unmatched route
+// SPA fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[FinSight] Running on port ${PORT} | API key: ${process.env.ANTHROPIC_API_KEY ? 'SET ✓' : 'NOT SET ✗'}`);
+  const key = process.env.ANTHROPIC_API_KEY;
+  console.log(`[FinSight] :${PORT} model=${MODEL} key=${key ? 'SET(' + key.slice(0,16) + '...)' : 'NOT SET ⚠️'}`);
 });
